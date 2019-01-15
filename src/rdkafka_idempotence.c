@@ -30,6 +30,8 @@
 #include "rdkafka_int.h"
 #include "rdkafka_request.h"
 
+#include <stdarg.h>
+
 /**
  * @name Idempotent Producer logic
  *
@@ -311,16 +313,26 @@ void rd_kafka_idemp_drain_reset (rd_kafka_t *rk) {
  *
  * The PID is not bumped until the queues are fully drained.
  *
+ * @param fmt is a human-readable reason for the bump
+ *
+ *
  * @locality any
  * @locks none
  */
-void rd_kafka_idemp_drain_epoch_bump (rd_kafka_t *rk) {
+void rd_kafka_idemp_drain_epoch_bump (rd_kafka_t *rk, const char *fmt, ...) {
+        va_list ap;
+        char buf[256];
+
+        va_start(ap, fmt);
+        rd_vsnprintf(buf, sizeof(buf), fmt, ap);
+        va_end(ap);
+
         rd_kafka_wrlock(rk);
         rd_kafka_dbg(rk, EOS, "DRAIN",
                      "Beginning partition drain for %s epoch bump "
-                     "for %d partition(s) with in-flight requests",
+                     "for %d partition(s) with in-flight requests: %s",
                      rd_kafka_pid2str(rk->rk_eos.pid),
-                     rd_atomic32_get(&rk->rk_eos.inflight_toppar_cnt));
+                     rd_atomic32_get(&rk->rk_eos.inflight_toppar_cnt), buf);
         rd_kafka_idemp_set_state(rk, RD_KAFKA_IDEMP_STATE_DRAIN_BUMP);
         rd_kafka_wrunlock(rk);
 }
@@ -331,14 +343,15 @@ void rd_kafka_idemp_drain_epoch_bump (rd_kafka_t *rk) {
  * @locks toppar_lock MUST be held
  * @locality broker thread (leader or not)
  */
-void rd_kafka_idemp_drain_toppar (rd_kafka_toppar_t *rktp) {
+void rd_kafka_idemp_drain_toppar (rd_kafka_toppar_t *rktp,
+                                  const char *reason) {
         if (rktp->rktp_eos.wait_drain)
                 return;
 
         rd_kafka_dbg(rktp->rktp_rkt->rkt_rk, EOS|RD_KAFKA_DBG_TOPIC, "DRAIN",
-                     "%.*s [%"PRId32"] beginning partition drain",
+                     "%.*s [%"PRId32"] beginning partition drain: %s",
                      RD_KAFKAP_STR_PR(rktp->rktp_rkt->rkt_topic),
-                     rktp->rktp_partition);
+                     rktp->rktp_partition, reason);
         rktp->rktp_eos.wait_drain = rd_true;
 }
 

@@ -426,7 +426,8 @@ There are three types of guarantees that the idempotent producer can satisfy:
               This guarantee is enabled by default, but may be disabled
               by setting `enable.gapless.guarantee` if individual message
               failure is not a concern.
-
+              Message timeouts (`message.timeout.ms`) will cause gaps which
+              are permitted by the gap-less guarantee.
 
 All three guarantees are in effect when idempotence is enabled, only
 gap-less may be disabled individually.
@@ -483,6 +484,45 @@ producing to explicit partitions with partitioner-based partitions
 since messages produced for the latter are queued separately until
 a topic's partition count is known, which would insert these messages
 after the partition-explicit messages regardless of produce order.
+
+
+#### Message timeout considerations
+
+If messages time out (due to `message.timeout.ms`) while in the producer queue
+there will be gaps the in the series of produced messages:
+
+E.g., Messages 1,2,3,4,5 are produced by the application.
+      While messages 2,3,4 are transmitted to the broker the connection to
+      the broker goes down.
+      While the broking is down the message timeout expires for message 2 and 3.
+      As the connection comes back up messages 4, 5 are transmitted to the
+      broker, resulting in a final written message sequence of 1, 4, 5.
+
+The producer gracefully handles this case by draining the in-flight requests
+for a given partition when one or more of its queued (not transmitted)
+messages are timed out. When all requests are drained the Epoch is bumped and
+the base sequence number is reset to the first message in the queue, effectively
+skipping the timed out messages as if they had never existed from the
+broker's point of view.
+The message status for timed out queued messages will be
+`RD_KAFKA_MSG_STATUS_NOT_PERSISTED`.
+
+If messages time out (also due to `message.timeout.ms`) while in-flight
+to the broker the protocol request will fail, the broker connection will
+be closed by the client, and the timed out messages will be removed
+from the producer queue. In this case the in-flight messages may be
+written to the topic log by the broker, even though a delivery report with
+error `ERR__MSG_TIMED_OUT` will be raised.
+The message status for timed out in-flight messages will be
+`RD_KAFKA_MSG_STATUS_POSSIBLY_PERSISTED`.
+
+An application may inspect the message status by calling
+`rd_kafka_message_status()` on the message in the delivery report callback.
+
+Despite the graceful handling of timeouts, we recommend to use a
+large `message.timeout.ms` to minimize the risk of timeouts.
+
+**Note**: `delivery.timeout.ms` is an alias for `message.timeout.ms`.
 
 
 #### Leader change

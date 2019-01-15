@@ -465,7 +465,11 @@ void rd_kafka_broker_fail (rd_kafka_broker_t *rkb,
 
         /* Purge the waiting-in-output-queue buffers,
          * might also get re-enqueued. */
-        rd_kafka_bufq_purge(rkb, &tmpq, err);
+        rd_kafka_bufq_purge(rkb, &tmpq,
+                            /* If failure was caused by a timeout,
+                             * adjust the error code for in-queue requests. */
+                            err == RD_KAFKA_RESP_ERR__TIMED_OUT ?
+                            RD_KAFKA_RESP_ERR__TIMED_OUT_QUEUE : err);
 
 	/* Update bufq for connection reset:
 	 *  - Purge connection-setup requests from outbufs since they will be
@@ -2738,7 +2742,11 @@ static int rd_kafka_broker_op_serve (rd_kafka_broker_t *rkb,
                                 /* Wait for all outstanding requests from
                                  * the previous leader to finish before
                                  * producing anything to this new leader. */
-                                rd_kafka_idemp_drain_toppar(rktp);
+                                rd_kafka_idemp_drain_toppar(
+                                        rktp,
+                                        "wait for outstanding requests to "
+                                        "finish before producing to "
+                                        "new leader");
                         }
                 }
 
@@ -3051,20 +3059,49 @@ static void rd_kafka_broker_internal_serve (rd_kafka_broker_t *rkb,
 
 
 /**
- * @brief Scan toppar's xmit queue for message timeouts.
- * @locality broker thread
- * @locks none
+ * @brief Scan toppar's xmit and producer queue for message timeouts and
+ *        enqueue delivery reports for timed out messages.
+ *
+ * @returns the number of messages timed out.
+ *
+ * @locality toppar's broker handler thread
+ * @locks toppar_lock MUST be held
  */
-static void rd_kafka_broker_toppar_msgq_scan (rd_kafka_broker_t *rkb,
-                                              rd_kafka_toppar_t *rktp,
-                                              rd_ts_t now) {
-        rd_kafka_msgq_t timedout = RD_KAFKA_MSGQ_INITIALIZER(timedout);
+static int rd_kafka_broker_toppar_msgq_scan (rd_kafka_broker_t *rkb,
+                                             rd_kafka_toppar_t *rktp,
+                                             rd_ts_t now) {
+        rd_kafka_msgq_t xtimedout = RD_KAFKA_MSGQ_INITIALIZER(xtimedout);
+        rd_kafka_msgq_t qtimedout = RD_KAFKA_MSGQ_INITIALIZER(qtimedout);
+        int xcnt, qcnt, cnt;
+        uint64_t first, last;
 
-        if (rd_kafka_msgq_age_scan(&rktp->rktp_xmit_msgq, &timedout, now)) {
-                /* Trigger delivery report for timed out messages */
-                rd_kafka_dr_msgq(rktp->rktp_rkt, &timedout,
-                                 RD_KAFKA_RESP_ERR__MSG_TIMED_OUT);
-        }
+        xcnt = rd_kafka_msgq_age_scan(rktp, &rktp->rktp_xmit_msgq,
+                                      &xtimedout, now);
+        qcnt = rd_kafka_msgq_age_scan(rktp, &rktp->rktp_msgq,
+                                      &qtimedout, now);
+
+        cnt = xcnt + qcnt;
+        if (likely(cnt == 0))
+                return 0;
+
+        /* Insert queue-timedout into xmitqueue-timedout in a sorted fashion */
+        rd_kafka_msgq_insert_msgq(&xtimedout, &qtimedout,
+                                  rktp->rktp_rkt->rkt_conf.msg_order_cmp);
+
+        first = rd_kafka_msgq_first(&xtimedout)->rkm_u.producer.msgid;
+        last = rd_kafka_msgq_last(&xtimedout)->rkm_u.producer.msgid;
+
+        rd_rkb_dbg(rkb, MSG, "TIMEOUT",
+                   "%s [%"PRId32"]: timed out %d+%d message(s) "
+                   "(MsgId %"PRIu64"..%"PRIu64"): message.timeout.ms exceeded",
+                   rktp->rktp_rkt->rkt_topic->str, rktp->rktp_partition,
+                   xcnt, qcnt, first, last);
+
+        /* Trigger delivery report for timed out messages */
+        rd_kafka_dr_msgq(rktp->rktp_rkt, &xtimedout,
+                         RD_KAFKA_RESP_ERR__MSG_TIMED_OUT);
+
+        return cnt;
 }
 
 
@@ -3104,6 +3141,7 @@ static int rd_kafka_toppar_producer_serve (rd_kafka_broker_t *rkb,
         int move_cnt = 0;
         unsigned int max_requests;
         unsigned int reqcnt;
+        int inflight = 0;
 
         /* By limiting the number of not-yet-sent buffers (rkb_outbufs) we
          * provide a backpressure mechanism to the producer loop
@@ -3123,17 +3161,37 @@ static int rd_kafka_toppar_producer_serve (rd_kafka_broker_t *rkb,
         }
 
         if (unlikely(do_timeout_scan)) {
-                /* Scan xmit queue for msg timeouts */
-                rd_kafka_broker_toppar_msgq_scan(rkb, rktp, now);
+                int timeoutcnt;
 
-                if (rd_kafka_is_idempotent(rkb->rkb_rk) &&
-                    !rd_kafka_pid_valid(pid)) {
-                        /* Idempotent producer: we don't have a
-                         * a PID, we can't transmit any messages.
-                         * We only get here in that case if
-                         * do_timeout_scan is true. */
-                        rd_kafka_toppar_unlock(rktp);
-                        return 0;
+                /* Scan queues for msg timeouts */
+                timeoutcnt = rd_kafka_broker_toppar_msgq_scan(rkb, rktp, now);
+
+                if (rd_kafka_is_idempotent(rkb->rkb_rk)) {
+                        if (!rd_kafka_pid_valid(pid)) {
+                                /* If we don't have a PID, we can't transmit
+                                 * any messages. */
+                                rd_kafka_toppar_unlock(rktp);
+                                return 0;
+
+                        } else if (timeoutcnt > 0) {
+                                /* Message timeouts will lead to gaps the in
+                                 * the message sequence and thus trigger
+                                 * OutOfOrderSequence errors from the broker.
+                                 * Bump the epoch to reset the base msgid after
+                                 * draining all partitions. */
+
+                                /* Must not hold toppar lock */
+                                rd_kafka_toppar_unlock(rktp);
+
+                                rd_kafka_idemp_drain_epoch_bump(
+                                        rkb->rkb_rk,
+                                        "%d message(s) timed out "
+                                        "on %s [%"PRId32"]",
+                                        timeoutcnt,
+                                        rktp->rktp_rkt->rkt_topic->str,
+                                        rktp->rktp_partition);
+                                return 0;
+                        }
                 }
         }
 
@@ -3179,15 +3237,16 @@ static int rd_kafka_toppar_producer_serve (rd_kafka_broker_t *rkb,
                                            rktp->rktp_partition);
                 }
 
+                inflight = rd_atomic32_get(&rktp->rktp_msgs_inflight);
+
                 if (unlikely(rktp->rktp_eos.wait_drain)) {
-                        int inflight = rd_atomic32_get(&rktp->
-                                                       rktp_msgs_inflight);
                         if (inflight) {
                                 /* Waiting for in-flight requests to
                                  * drain/finish before producing anything more.
                                  * This is used to recover to a consistent
                                  * state when the partition leader
-                                 * has changed. */
+                                 * has changed, or timed out messages
+                                 * have been removed from the queue. */
 
                                 rd_rkb_dbg(rkb, QUEUE, "TOPPAR",
                                            "%.*s [%"PRId32"] waiting for "
@@ -3220,7 +3279,7 @@ static int rd_kafka_toppar_producer_serve (rd_kafka_broker_t *rkb,
         if (r == 0)
                 return 0;
 
-        rd_kafka_msgq_verify_order(rktp, &rktp->rktp_xmit_msgq, 0, rd_true);
+        rd_kafka_msgq_verify_order(rktp, &rktp->rktp_xmit_msgq, 0, rd_false);
 
         rd_rkb_dbg(rkb, QUEUE, "TOPPAR",
                    "%.*s [%"PRId32"] %d message(s) in "
@@ -3372,6 +3431,7 @@ static void rd_kafka_broker_producer_serve (rd_kafka_broker_t *rkb,
         rd_interval_t timeout_scan;
         unsigned int initial_state = rkb->rkb_state;
         rd_ts_t now;
+        int cnt = 0;
 
         rd_interval_init(&timeout_scan);
 
@@ -3387,8 +3447,12 @@ static void rd_kafka_broker_producer_serve (rd_kafka_broker_t *rkb,
 
 		rd_kafka_broker_unlock(rkb);
 
-                do_timeout_scan = rd_interval(&timeout_scan, 1000*1000,
-                                              now) >= 0;
+                /* Perform timeout scan on first iteration, thus
+                 * on each state change, to make sure messages in
+                 * partition rktp_xmit_msgq are timed out before
+                 * being attempted to re-transmit. */
+                do_timeout_scan = cnt++ == 0 ||
+                        rd_interval(&timeout_scan, 1000*1000, now) >= 0;
 
                 rd_kafka_broker_produce_toppars(rkb, now, &next_wakeup,
                                                 do_timeout_scan);
