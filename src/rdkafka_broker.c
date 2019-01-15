@@ -3126,7 +3126,7 @@ rd_kafka_broker_outbufs_space (rd_kafka_broker_t *rkb) {
  *
  * @returns the number of messages produced.
  *
- * @locks toppar_lock(rktp) MUST be held.
+ * @locks none
  * @locality broker thread
  */
 static int rd_kafka_toppar_producer_serve (rd_kafka_broker_t *rkb,
