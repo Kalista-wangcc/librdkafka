@@ -325,6 +325,11 @@ static int rd_kafka_cgrp_coord_update (rd_kafka_cgrp_t *rkcg,
                                 coord_id == -1 ?
                                 RD_KAFKA_CGRP_STATE_QUERY_COORD :
                                 RD_KAFKA_CGRP_STATE_WAIT_BROKER);
+                else if (rkcg->rkcg_state == RD_KAFKA_CGRP_STATE_WAIT_BROKER &&
+                         rkcg->rkcg_curr_coord)
+                        rd_kafka_cgrp_set_state(
+                                rkcg,
+                                RD_KAFKA_CGRP_STATE_WAIT_BROKER_TRANSPORT);
                 return 0;
         }
 
