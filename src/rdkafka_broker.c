@@ -4507,6 +4507,7 @@ rd_kafka_broker_t *rd_kafka_broker_add (rd_kafka_t *rk,
 
 	rkb->rkb_source = source;
 	rkb->rkb_rk = rk;
+        rkb->rkb_ts_state = rd_clock();
 	rkb->rkb_nodeid = nodeid;
 	rkb->rkb_proto = proto;
         rkb->rkb_port = port;
